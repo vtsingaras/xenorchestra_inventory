@@ -12,21 +12,32 @@ import os
 import sys
 
 
-def static_vars(**kwargs):
-    def decorate(func):
-        for k in kwargs:
-            setattr(func, k, kwargs[k])
-        return func
-    return decorate
+cache_file = str()
+object_cache = dict()
+ansible_inventory = dict()
+host_inventory = dict()
 
 
-@static_vars(last_refresh=0, obj_cache={})
-def getXoObjectsByType(xoa_instance: xo, obj_type: str, refresh: bool = False, cache_seconds: int = 10) -> Dict:
-    if refresh is True or (time() - getXoObjectsByType.last_refresh > cache_seconds) or len(getXoObjectsByType.obj_cache) == 0:
-        getXoObjectsByType.obj_cache = xoa_instance.xo_getAllObjects()
-        getXoObjectsByType.last_refresh = time()
+def cacheIsValid(cache_seconds: int = 600):
+    if os.path.isfile(cache_file):
+        mtime = os.path.getmtime(cache_file)
+        if mtime + cache_seconds > time():
+            return True
 
-    return {uuid: obj for uuid, obj in getXoObjectsByType.obj_cache.items() if obj['type'] == obj_type}
+    return False
+
+
+def getXoObjectsByType(xoa_instance: xo, obj_type: str, refresh: bool = False, cache_seconds: int = 600) -> Dict:
+    global object_cache
+    if refresh is True or not cacheIsValid(cache_seconds):
+        object_cache = xoa_instance.xo_getAllObjects()
+        with open(cache_file, 'w') as cache_f:
+            cache_f.write(json.dumps(object_cache))
+    else:
+        with open(cache_file, 'r') as cache_f:
+            object_cache = json.loads(cache_f.read())
+
+    return {uuid: obj for uuid, obj in object_cache.items() if obj['type'] == obj_type}
 
 
 def inventory_addHostVars(host_name: str, host_vars: Dict):
@@ -81,9 +92,6 @@ def hostIsExcluded(vm_data: Dict, excluded_tags: List[str], excluded_regexes: Li
     return excluded
 
 
-ansible_inventory = dict()
-host_inventory = dict()
-
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='XenOrchestra Ansible Dynamic Inventory source.')
     action = parser.add_mutually_exclusive_group(required=True)
@@ -94,8 +102,10 @@ if __name__ == '__main__':
 
     config = configparser.ConfigParser()
     config.read(os.path.dirname(os.path.realpath(__file__)) + '/xenorchestra.ini')
-
+    cache_seconds = int(config.get('xenorchestra', 'cache_seconds'))
+    cache_file = config.get('xenorchestra', 'cache_file')
     xoa_host = config.get('xenorchestra', 'host')
+
     login_args = dict()
     if config.has_option('xenorchestra', 'token'):
         login_args['token'] = config.get('xenorchestra', 'token')
@@ -105,7 +115,7 @@ if __name__ == '__main__':
 
     allowed_networks_str = ['0.0.0.0/0', ]
     if config.has_option('xenorchestra', 'management_networks'):
-        allowed_networks_str = json.loads(config.get('xenorchestra', 'management_nnetworks'))
+        allowed_networks_str = json.loads(config.get('xenorchestra', 'management_networks'))
     allowed_networks = [ip_network(ip_net) for ip_net in allowed_networks_str]
 
     host_deny_regex = list()
@@ -118,7 +128,7 @@ if __name__ == '__main__':
         host_deny_tags = json.loads(config.get('xenorchestra', 'deny_tags'))
 
     xoa = xo('ws://' + xoa_host, **login_args)
-    allVM_dict = getXoObjectsByType(xoa, 'VM')
+    allVM_dict = getXoObjectsByType(xoa, 'VM', cache_seconds=cache_seconds)
 
     for vm_uuid, vm_data in allVM_dict.items():
         # Get VM management address
